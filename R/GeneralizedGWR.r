@@ -154,7 +154,8 @@ ggwr.basic<-function(formula, data, regression.points, bw, family ="poisson", ke
 
     ##model calibration
     if(family=="poisson")
-        res1<-gwr.poisson(y,x,regression.points,W1.mat,W2.mat,hatmatrix,tol, maxiter)
+        ##res1<-gwr.poisson(y,x,regression.points,W1.mat,W2.mat,hatmatrix,tol, maxiter)
+        res1<-gwr.poisson.fe(y,x,regression.points,W1.mat,W2.mat,hatmatrix,tol, maxiter)
     if(family=="binomial")
         res1<-gwr.binomial(y,x,regression.points,W1.mat,W2.mat,hatmatrix,tol, maxiter)
     ####################################
@@ -511,6 +512,247 @@ gwr.poisson<-function(y,x,regression.points,W1.mat,W2.mat,hatmatrix,tol=1.0e-5, 
     else
         SDF <- SpatialPointsDataFrame(coords=rp.locat, data=gwres.df, proj4string=CRS(p4s), match.ID=F)
    ##############
+    if(hatmatrix)
+      res<-list(GW.diagnostic=GW.diagnostic,glms=glms,SDF=SDF)
+    else
+      res <- list(glms=glms,SDF=SDF)
+}
+
+############ Possion GWGLM
+gwr.poisson.fe <-function(y,x,regression.points,W1.mat,W2.mat,hatmatrix,tol=1.0e-5, maxiter=500, fe.reg = T, fe.col = 1, fe.cutoff = 1.0e-8)
+{
+    p4s <- as.character(NA)
+    if (is(regression.points, "Spatial"))
+    {
+      p4s <- proj4string(regression.points)
+    }
+    ############################################
+    ##Generalized linear regression
+    glms<-glm.fit(x, y, family = poisson()) 
+    null.dev <- glms$null.deviance
+    glm.dev <-glms$deviance
+    glm.pseudo.r2 <- 1- glm.dev/null.dev 
+    glms$pseudo.r2 <- glm.pseudo.r2
+    var.n<-ncol(x)
+    dp.n<-nrow(x)
+    ########change the aic
+    glms$aic <- glm.dev + 2*var.n
+    glms$aicc <- glm.dev + 2*var.n + 2*var.n*(var.n+1)/(dp.n-var.n-1)
+    ############################################
+    if(is(regression.points, "Spatial"))
+    	 rp.locat<-coordinates(regression.points)
+    else
+       rp.locat <- regression.points
+    rp.n<-nrow(rp.locat)
+    betas <- matrix(0, nrow=rp.n, ncol=var.n)
+    betas1 <- matrix(0, nrow=dp.n, ncol=var.n)
+    betas.SE <-matrix(0, nrow=dp.n, ncol=var.n)
+    betas.TV <-matrix(0, nrow=dp.n, ncol=var.n)
+    ##S: hatmatrix
+    S<-matrix(nrow=dp.n,ncol=dp.n)
+    #C.M<-matrix(nrow=dp.n,ncol=dp.n)
+    colnames(betas) <- colnames(x)
+    ## colnames(betas)[1]<-"Intercept"  
+    ## fixed effects regression: only include fe-dummies with weight > cutoff
+    if (fe.reg) {
+        ## initialisation
+        fe.col.name <- names(regression.points@data)[fe.col]
+        fe.cols <- unique(regression.points@data[, fe.col])
+        iv.cols <- which(!grepl('factor', colnames(x)))
+        x_index <- 1:dp.n
+        W1.sub <- list()
+        W2.sub <- list()
+        wt2.sub <- list()
+        x.sub <- list()
+        gwr.sub <- list()
+        fe.sub.cols <- list()
+        
+        for (i in 1:dp.n) {
+            ## find subset of observations where weight > cutoff
+            gwr.sub[[i]] <- which(W1.mat[,i] > fe.cutoff)
+            ## find non-zero fixed effects and corresponding columns
+            fe.sub <- unique(regression.points@data[gwr.sub[[i]], fe.col])
+            fe.sub.cols[[i]] <- which(fe.cols %in% fe.sub) + length(iv.cols)
+            ## subset weight matrix
+            W1.sub[[i]] <- W1.mat[gwr.sub[[i]], i]
+            W2.sub[[i]] <- W2.mat[gwr.sub[[i]], i]
+            ## subset x and create dummy matrix
+            x.sub[[i]] <- cbind(x[gwr.sub[[i]], iv.cols],
+                                model.matrix(~ factor(get(fe.col.name)) -1,
+                                             regression.points@data[gwr.sub[[i]], ]
+                                             )
+                                )
+        }
+    }
+    ####################################
+    ##model calibration
+    
+    it.count <- 0
+    llik <- 0.0
+    mu <- y + 0.1
+    nu <- log(mu)
+    cat(paste("Begin LL iterations", Sys.time(), "\n\n"))
+    cat(" Iteration    Log-Likelihood\n=========================\n")
+    wt2 <- rep(1,dp.n)
+    repeat {
+     y.adj <- nu + (y - mu)/mu
+     for (i in 1:dp.n)
+     {
+         W.i<-W1.mat[,i]
+         if (fe.reg) {
+             y.sub <- y.adj[gwr.sub[[i]]]
+             wt2.sub <- wt2[gwr.sub[[i]]]
+             gwsi<-gw_reg(x.sub[[i]],y.sub,W1.sub[[i]]*wt2.sub,hatmatrix=F,i)
+             betas1[i,c(iv.cols, fe.sub.cols[[i]])]<-gwsi[[1]]
+         } else {
+             gwsi<-gw_reg(x,y.adj,W.i*wt2,hatmatrix=F,i)
+             betas1[i,]<-gwsi[[1]]
+         }         
+     }
+     nu <- gw.fitted(x,betas1)
+     mu <- exp(nu)
+     nu_test <<- nu
+     mu_test <<- mu
+     old.llik <- llik
+     #llik <- sum(y*nu - mu - log(gamma(y+1)))
+     #print(paste0('original: ', llik))
+
+     ################################ edits #####################
+     llik <- sum(dpois(y, mu, log = TRUE))
+     #print(paste0('new: ', llik))
+     ################################ edits #####################
+     
+     cat(paste("   ",formatC(it.count,digits=4,width=4),"    ",formatC(llik,digits=4,width=7),"\n"))
+     if (abs((old.llik - llik)/llik) < tol) break
+     wt2 <- as.numeric(mu)
+     it.count <- it.count+1
+     if (it.count == maxiter) break
+    }
+    cat(paste("End of LL iterations", Sys.time(), "\n"))
+    GW.diagnostic <- NULL
+    gw.dev <- 0
+    for(i in 1:dp.n) {
+        if(y[i]!=0)
+            gw.dev <- gw.dev + 2*(y[i]*(log(y[i]/mu[i])-1)+mu[i])
+        else
+            gw.dev <- gw.dev + 2* mu[i]
+    }
+
+     #gw.dev <- 2*sum(y*log(y/mu)-(y-mu))     
+     #local.dev <- numeric(dp.n)     
+     #local.null.dev <- numeric(dp.n)
+     #local.pseudo.r2 <- numeric(dp.n) 
+    if(hatmatrix) {
+        for (i in 1:dp.n) {
+            if (fe.reg) {
+                y.sub <- y.adj[gwr.sub[[i]]]
+                wt2.sub <- wt2[gwr.sub[[i]]]
+                focus_i <- which(x_index[gwr.sub[[i]]] == i)       
+                gwsi<-gw_reg(x.sub[[i]],y.sub,W2.sub[[i]]*wt2.sub,hatmatrix,focus_i)
+                betas[i, c(iv.cols, fe.sub.cols[[i]])]<-gwsi[[1]]
+                S[i,gwr.sub[[i]]]<-gwsi[[2]]
+                Ci<-gwsi[[3]]
+                invwt2 <- 1.0 /as.numeric(wt2.sub)
+                betas.SE[i, c(iv.cols, fe.sub.cols[[i]])] <- diag((Ci*invwt2) %*% t(Ci))
+            } else {
+                W.i<-W2.mat[,i]
+                gwsi<-gw_reg(x,y.adj,W.i*wt2,hatmatrix,i)
+                betas[i,]<-gwsi[[1]]
+                ##Add the smoother y.adjust, see equation (30) in Nakaya(2005)
+                                        #S[i,]<-gwsi[[2]]
+                S[i,]<-gwsi[[2]]
+                Ci<-gwsi[[3]]
+                                        #betas.SE[i,]<-diag(Ci%*%t(Ci))
+                invwt2 <- 1.0 /as.numeric(wt2)
+                betas.SE[i,] <- diag((Ci*invwt2) %*% t(Ci))# diag(Ci/wt2%*%t(Ci))  #see Nakaya et al. (2005)
+            }
+            
+        }
+        cat(paste("End of hatmatrix loop", Sys.time(), "\n"))
+        ## NB: something in the lines below is VERY time consuming
+        
+        tr.S<-sum(diag(S))
+        ####trace(SWS'W^-1) is used here instead of tr.StS
+        #tr.StS<-sum(S^2)
+        tr.StS<- sum(diag(S%*%diag(wt2)%*%t(S)%*% diag(1/wt2)))
+        ###edf is different from the definition in Chris' code
+        #edf<-dp.n-2*tr.S+tr.StS
+        yhat<-gw.fitted(x, betas)
+        residual<-y-exp(yhat)
+        ########rss <- sum((y - gwr.fitted(x,b))^2)
+        #rss <- sum((y-exp(yhat))^2)
+        #sigma.hat <- rss/edf
+        #sigma.aic <- rss/dp.n
+        for(i in 1:dp.n) {
+            ##betas.SE[i,]<-sqrt(sigma.hat*betas.SE[i,])
+            if (fe.reg) {
+                betas.SE[i,c(iv.cols, fe.sub.cols[[i]])]<-sqrt(betas.SE[i,c(iv.cols, fe.sub.cols[[i]])])
+                betas.TV[i,c(iv.cols, fe.sub.cols[[i]])]<-betas[i,c(iv.cols, fe.sub.cols[[i]])]/betas.SE[i,c(iv.cols, fe.sub.cols[[i]])]
+            } else {
+                betas.SE[i,]<-sqrt(betas.SE[i,])
+                betas.TV[i,]<-betas[i,]/betas.SE[i,] 
+            }
+        }
+        #AICc <- -2*llik + 2*tr.S*dp.n/(dp.n-tr.S-2) 
+        #AICc <- -2*llik + 2*tr.S + 2*tr.S*(tr.S+1)/(dp.n-tr.S-1)  # This is generic form of AICc (TN)
+        AIC <- gw.dev + 2*tr.S
+        AICc <- gw.dev + 2*tr.S + 2*tr.S*(tr.S+1)/(dp.n-tr.S-1) 
+        #yss.g <- sum((y - mean(y))^2)
+        #gw.R2<-1-rss/yss.g; ##R Square valeu
+        #gwR2.adj<-1-(1-gw.R2)*(dp.n-1)/(edf-1) #Adjusted R squared valu
+        
+        pseudo.R2 <- 1- gw.dev/null.dev
+        GW.diagnostic<-list(gw.deviance=gw.dev,AICc=AICc,AIC=AIC,pseudo.R2 =pseudo.R2)
+        cat(paste("End of hatmatrix calculations", Sys.time(),  "\n"))
+     }
+     else
+     {
+        for (i in 1:rp.n)
+        {
+            if (fe.reg) {
+                y.sub <- y.adj[gwr.sub[[i]]]
+                wt2.sub <- wt2[gwr.sub[[i]]]
+                focus_i <- which(x_index[gwr.sub[[i]]] == i)
+                gwsi<-gw_reg(x.sub[[i]],y.sub,W2.sub[[i]]*wt2.sub,hatmatrix,focus_i)
+                betas[i, c(iv.cols, fe.sub.cols[[i]])]<-gwsi[[1]]
+            } else {
+                W.i<-W2.mat[,i]
+                gwsi<-gw_reg(x,y.adj,W.i*wt2,hatmatrix,i)
+                betas[i,]<-gwsi[[1]] ######See function by IG
+            }
+        }     
+     }
+    if (hatmatrix)                                         
+    {
+      gwres.df<-data.frame(betas,y,exp(yhat),residual,betas.SE,betas.TV)
+      colnames(gwres.df)<-c(c(c(colnames(betas),c("y","yhat","residual")),paste(colnames(betas), "SE", sep="_")),paste(colnames(betas), "TV", sep="_"))
+    }
+    else
+    {
+      gwres.df<-data.frame(betas)
+    }
+    rownames(rp.locat)<-rownames(gwres.df)
+    griddedObj <- F
+    if (is(regression.points, "Spatial"))
+    { 
+        if (is(regression.points, "SpatialPolygonsDataFrame"))
+        {
+           polygons<-polygons(regression.points)
+           #SpatialPolygons(regression.points)
+           #rownames(gwres.df) <- sapply(slot(polygons, "polygons"),
+                              #  function(i) slot(i, "ID"))
+           SDF <-SpatialPolygonsDataFrame(Sr=polygons, data=gwres.df, match.ID=F)
+        }
+        else
+        {
+           griddedObj <- gridded(regression.points)
+           SDF <- SpatialPointsDataFrame(coords=rp.locat, data=gwres.df, proj4string=CRS(p4s), match.ID=F)
+           gridded(SDF) <- griddedObj 
+        }
+    }
+    else
+        SDF <- SpatialPointsDataFrame(coords=rp.locat, data=gwres.df, proj4string=CRS(p4s), match.ID=F)
+##############
     if(hatmatrix)
       res<-list(GW.diagnostic=GW.diagnostic,glms=glms,SDF=SDF)
     else
